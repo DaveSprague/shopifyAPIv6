@@ -1,5 +1,22 @@
 __pycache__/
 .env
+
+# Cache directory for order data
+cache/
+*.pkl
+
+# Generated files
 n*.json
 *.csv
+*.xlsx
+*.xls
+
+# JSON trace files
+*_trace_*.json
+
+# Generated reconciliation files
+*reconciliation*.csv
+*transactions*.csv
+*mismatches*.csv
+*priorities*.csv
 
