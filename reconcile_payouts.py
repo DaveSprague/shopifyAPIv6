@@ -104,6 +104,91 @@ def select_payout_csv_file():
             print(f"❌ Error: {e}")
             return None
 
+def select_timezone_and_format():
+    """Allow user to select timezone and format for reconciliation"""
+    print(f"\n🌍 SELECT TIMEZONE FOR RECONCILIATION")
+    print(f"=" * 45)
+    print(f"Choose the timezone for grouping sales and payout data:\n")
+    
+    print(f"1. UTC (Recommended for payout reconciliation)")
+    print(f"   • All data grouped by UTC dates")
+    print(f"   • Payout transactions in original UTC timezone")
+    print(f"   • Most accurate for matching Shopify payouts")
+    print()
+    
+    print(f"2. Shop Timezone ({SALES_TIMEZONE})")
+    print(f"   • All data grouped by {SALES_TIMEZONE} dates")
+    print(f"   • Payout transactions converted to {SALES_TIMEZONE}")
+    print(f"   • Better for business reporting and Shopify report comparison")
+    print()
+    
+    # Get timezone selection
+    while True:
+        try:
+            choice = input("Enter your choice (1-2): ").strip()
+            
+            if choice == "1":
+                print(f"\n✅ Selected: UTC timezone")
+                use_utc_timezone = True
+                target_timezone = "UTC"
+                break
+            elif choice == "2":
+                print(f"\n✅ Selected: {SALES_TIMEZONE} timezone")
+                use_utc_timezone = False
+                target_timezone = SALES_TIMEZONE
+                break
+            else:
+                print("❌ Please enter 1 or 2")
+                
+        except KeyboardInterrupt:
+            print("\n🚪 Cancelled by user")
+            return None, None, None
+        except Exception as e:
+            print(f"❌ Error: {e}")
+            return None, None, None
+    
+    # Get format selection
+    print(f"\n📊 SELECT OUTPUT FORMAT")
+    print(f"=" * 30)
+    print(f"Choose the CSV format:\n")
+    
+    print(f"1. Standard (Non-transposed)")
+    print(f"   • Dates in rows, metrics in columns")
+    print(f"   • Easier to work with in Excel")
+    print(f"   • Good for data analysis and filtering")
+    print()
+    
+    print(f"2. Transposed")
+    print(f"   • Dates in columns, metrics in rows")
+    print(f"   • Easier for bookkeepers to review")
+    print(f"   • Better for monthly/daily comparisons")
+    print()
+    
+    while True:
+        try:
+            choice = input("Enter your choice (1-2): ").strip()
+            
+            if choice == "1":
+                print(f"\n✅ Selected: Standard (Non-transposed) format")
+                use_transposed = False
+                break
+            elif choice == "2":
+                print(f"\n✅ Selected: Transposed format")
+                use_transposed = True
+                break
+            else:
+                print("❌ Please enter 1 or 2")
+                
+        except KeyboardInterrupt:
+            print("\n🚪 Cancelled by user")
+            return None, None, None
+        except Exception as e:
+            print(f"❌ Error: {e}")
+            return None, None, None
+    
+    return use_utc_timezone, target_timezone, use_transposed
+
+
 def get_query_hash(query_string, date_range):
     """Generate hash for GraphQL query and date range to detect changes"""
     # Combine query and date range for hashing
@@ -253,9 +338,21 @@ def load_payout_csv(filepath):
     return df
 
 # Extract date range based on all payout transactions
-def extract_utc_date_range(payout_df):
-    min_date = payout_df['Transaction Date'].min().date()
-    max_date = payout_df['Transaction Date'].max().date()
+def extract_date_range(payout_df, use_utc_timezone):
+    """Extract date range from payout data using the specified timezone"""
+    if use_utc_timezone:
+        # Use UTC dates directly
+        min_date = payout_df['Transaction Date'].min().date()
+        max_date = payout_df['Transaction Date'].max().date()
+        print(f"📅 Using UTC timezone for date range extraction")
+    else:
+        # Convert to shop timezone for date range
+        payout_df_tz = payout_df.copy()
+        payout_df_tz['Transaction Date'] = payout_df_tz['Transaction Date'].dt.tz_convert(SALES_TIMEZONE)
+        min_date = payout_df_tz['Transaction Date'].min().date()
+        max_date = payout_df_tz['Transaction Date'].max().date()
+        print(f"📅 Using {SALES_TIMEZONE} timezone for date range extraction")
+    
     return min_date, max_date
 
 # Send paginated GraphQL request
@@ -386,35 +483,22 @@ query getOrders($cursor: String, $queryString: String) {
 
 from collections import defaultdict
 
-def parse_orders(order_data):
-    # Create data structures for both UTC and shop timezone
-    by_date_utc = defaultdict(lambda: defaultdict(float))
-    by_date_shop = defaultdict(lambda: defaultdict(float))
-    trace_utc = defaultdict(list)
-    trace_shop = defaultdict(list)
-    detailed_transactions_utc = defaultdict(list)
-    detailed_transactions_shop = defaultdict(list)
+def parse_orders(order_data, use_utc_timezone, target_timezone):
+    """Parse orders using the specified timezone"""
+    # Create data structures for the selected timezone
+    by_date = defaultdict(lambda: defaultdict(float))
+    detailed_transactions = defaultdict(list)
+    
+    print(f"🔄 Processing orders using {target_timezone} timezone")
 
     for order in order_data:
-        # Calculate dates in both timezones
-        created_utc = pd.to_datetime(order['createdAt']).tz_convert('UTC').date()
-        created_shop = pd.to_datetime(order['createdAt']).tz_convert(SALES_TIMEZONE).date()
-        processed_utc = pd.to_datetime(order.get('processedAt', order['createdAt'])).tz_convert('UTC').date()
-        processed_shop = pd.to_datetime(order.get('processedAt', order['createdAt'])).tz_convert(SALES_TIMEZONE).date()
+        # Calculate dates in the target timezone
+        created_dt = pd.to_datetime(order['createdAt']).tz_convert(target_timezone)
+        processed_dt = pd.to_datetime(order.get('processedAt', order['createdAt'])).tz_convert(target_timezone)
         
-        date_str_utc = str(created_utc)
-        date_str_shop = str(created_shop)
-        
-        # Store trace data for both timezones
-        order_trace = {
-            'order_name': order['name'],
-            'financial_status': order.get('displayFinancialStatus'),
-            'fulfillment_status': order.get('displayFulfillmentStatus'),
-            'created_utc': str(created_utc),
-            'created_shop': str(created_shop)
-        }
-        trace_utc[date_str_utc].append(order_trace)
-        trace_shop[date_str_shop].append(order_trace)
+        created_date = created_dt.date()
+        processed_date = processed_dt.date()
+        date_str = str(created_date)
 
         # Basic order totals - all essential fields are guaranteed to exist
         subtotal = float(order['subtotalPriceSet']['presentmentMoney']['amount'])
@@ -430,176 +514,118 @@ def parse_orders(order_data):
         total_received = float(order['totalReceivedSet']['presentmentMoney']['amount'])
         total_received_chk = net_payment_chk + refunds
 
-        # Aggregate by creation date for both timezones
-        for by_date, date_str in [(by_date_utc, date_str_utc), (by_date_shop, date_str_shop)]:
-            by_date[date_str]['gross_sales'] += gross_sales
-            by_date[date_str]['subtotal'] += subtotal
-            by_date[date_str]['discounts'] += discounts
-            by_date[date_str]['tax'] += tax
-            by_date[date_str]['shipping'] += shipping
-            by_date[date_str]['tips'] += tips
-            by_date[date_str]['refunds'] += refunds
-            by_date[date_str]['net_payment'] += net_payment
-            by_date[date_str]['net_payment_chk'] += net_payment_chk
-            by_date[date_str]['outstanding'] += outstanding
-            by_date[date_str]['total_received'] += total_received
-            by_date[date_str]['total_received_chk'] += total_received_chk
-            by_date[date_str]['order_count'] += 1
+        # Aggregate by creation date
+        by_date[date_str]['gross_sales'] += gross_sales
+        by_date[date_str]['subtotal'] += subtotal
+        by_date[date_str]['discounts'] += discounts
+        by_date[date_str]['tax'] += tax
+        by_date[date_str]['shipping'] += shipping
+        by_date[date_str]['tips'] += tips
+        by_date[date_str]['refunds'] += refunds
+        by_date[date_str]['net_payment'] += net_payment
+        by_date[date_str]['net_payment_chk'] += net_payment_chk
+        by_date[date_str]['outstanding'] += outstanding
+        by_date[date_str]['total_received'] += total_received
+        by_date[date_str]['total_received_chk'] += total_received_chk
+        by_date[date_str]['order_count'] += 1
 
-        # Process transactions for payment tracking in both timezones
+        # Process transactions for payment tracking
         for txn in order['transactions']:
             if txn['status'] != "SUCCESS":
                 continue
                 
-            txn_date_utc = pd.to_datetime(txn['processedAt']).tz_convert('UTC').date()
-            txn_date_shop = pd.to_datetime(txn['processedAt']).tz_convert(SALES_TIMEZONE).date()
-            txn_date_str_utc = str(txn_date_utc)
-            txn_date_str_shop = str(txn_date_shop)
+            txn_date = pd.to_datetime(txn['processedAt']).tz_convert(target_timezone).date()
+            txn_date_str = str(txn_date)
             
             amount = float(txn['amountSet']['presentmentMoney']['amount'])
             gateway = txn['gateway']
             kind = txn['kind']
             
-            # Process for both timezones
-            for by_date, txn_date_str, detailed_transactions in [
-                (by_date_utc, txn_date_str_utc, detailed_transactions_utc),
-                (by_date_shop, txn_date_str_shop, detailed_transactions_shop)
-            ]:
-                # Track by transaction date (when money actually moved)
-                by_date[txn_date_str][f'{gateway}_{kind.lower()}'] += amount
-                
-                # For Shopify Payments, only count AUTHORIZATION transactions to avoid double-counting
-                # CAPTURE transactions happen after AUTHORIZATION and represent the same money movement
-                if 'shopify' in gateway.lower() and kind.upper() == 'AUTHORIZATION':
-                    by_date[txn_date_str]['shopify_payments'] += amount
-                # For other gateways, count SALE transactions (immediate capture)
-                elif 'shopify' not in gateway.lower() and kind.upper() == 'SALE':
-                    if 'gift' in gateway.lower():
-                        by_date[txn_date_str]['gift_card'] += amount
-                    elif 'manual' in gateway.lower() or 'cash' in gateway.lower():
-                        by_date[txn_date_str]['cash'] += amount
-                    else:
-                        by_date[txn_date_str]['manual'] += amount
-                # Count refunds separately regardless of gateway
-                elif kind.upper() == 'REFUND':
-                    by_date[txn_date_str][f'{gateway}_refunds'] += amount
-                
-                # Store detailed transaction info
-                detailed_transactions[txn_date_str].append({
-                    'order_name': order['name'],
-                    'transaction_id': txn['id'],
-                    'kind': kind,
-                    'gateway': gateway,
-                    'amount': amount,
-                    'test': txn.get('test', False),
-                    'processed_utc': str(txn_date_utc),
-                    'processed_shop': str(txn_date_shop)
-                })
+            # Track by transaction date (when money actually moved)
+            by_date[txn_date_str][f'{gateway}_{kind.lower()}'] += amount
+            
+            # For Shopify Payments, only count AUTHORIZATION transactions to avoid double-counting
+            # CAPTURE transactions happen after AUTHORIZATION and represent the same money movement
+            if 'shopify' in gateway.lower() and kind.upper() == 'AUTHORIZATION':
+                by_date[txn_date_str]['shopify_payments'] += amount
+            # For other gateways, count SALE transactions (immediate capture)
+            elif 'shopify' not in gateway.lower() and kind.upper() == 'SALE':
+                if 'gift' in gateway.lower():
+                    by_date[txn_date_str]['gift_card'] += amount
+                elif 'manual' in gateway.lower() or 'cash' in gateway.lower():
+                    by_date[txn_date_str]['cash'] += amount
+                else:
+                    by_date[txn_date_str]['manual'] += amount
+            # Count refunds separately regardless of gateway
+            elif kind.upper() == 'REFUND':
+                by_date[txn_date_str][f'{gateway}_refunds'] += amount
+            
+            # Store detailed transaction info
+            detailed_transactions[txn_date_str].append({
+                'order_name': order['name'],
+                'transaction_id': txn['id'],
+                'kind': kind,
+                'gateway': gateway,
+                'amount': amount,
+                'test': txn.get('test', False),
+                'processed_date': str(txn_date),
+                'timezone': target_timezone
+            })
 
-        # Process basic refund information for both timezones
+        # Process basic refund information
         for refund in order.get('refunds', []):
-            refund_date_utc = pd.to_datetime(refund['createdAt']).tz_convert('UTC').date()
-            refund_date_shop = pd.to_datetime(refund['createdAt']).tz_convert(SALES_TIMEZONE).date()
-            refund_date_str_utc = str(refund_date_utc)
-            refund_date_str_shop = str(refund_date_shop)
+            refund_date = pd.to_datetime(refund['createdAt']).tz_convert(target_timezone).date()
+            refund_date_str = str(refund_date)
             refund_amount = float(refund['totalRefundedSet']['presentmentMoney']['amount'])
             
-            by_date_utc[refund_date_str_utc]['refund_amount'] += refund_amount
-            by_date_shop[refund_date_str_shop]['refund_amount'] += refund_amount
+            by_date[refund_date_str]['refund_amount'] += refund_amount
 
-        # Calculate reconciliation metrics for both timezones
-        for by_date, date_str in [(by_date_utc, date_str_utc), (by_date_shop, date_str_shop)]:
-            by_date[date_str]['calculated_total'] = subtotal + tax + shipping + tips - discounts
+        # Calculate reconciliation metrics
+        by_date[date_str]['calculated_total'] = subtotal + tax + shipping + tips - discounts
 
-    return (by_date_utc, trace_utc, detailed_transactions_utc, 
-            by_date_shop, trace_shop, detailed_transactions_shop)
+    return by_date, detailed_transactions
 
-def write_outputs(by_date_utc, trace_utc, detailed_transactions_utc, 
-                  by_date_shop, trace_shop, detailed_transactions_shop, payout_df):
+def write_outputs(by_date, detailed_transactions, payout_df, use_utc_timezone, target_timezone, use_transposed):
+    """Write reconciliation outputs using the specified timezone and format"""
     
-    # Generate UTC-aligned data (for payout reconciliation)
-    print("   📊 Generating UTC-aligned reconciliation data...")
-    df_utc = generate_reconciliation_dataframe(by_date_utc, detailed_transactions_utc, payout_df, "UTC")
-    print("   💾 Writing daily_sales_reconciliation_utc.csv...")
-    df_utc.to_csv("daily_sales_reconciliation_utc.csv", index=False)
+    # Generate reconciliation data
+    print(f"   📊 Generating {target_timezone} reconciliation data...")
+    df = generate_reconciliation_dataframe(by_date, detailed_transactions, payout_df, target_timezone)
     
-    # Create transposed view for UTC data
-    print("   📋 Creating transposed UTC view...")
-    df_utc_t = df_utc.set_index("date").T
-    df_utc_t.to_csv("transposed_reconciliation_utc.csv")
+    # Generate filename with timezone
+    timezone_suffix = "UTC" if use_utc_timezone else "ShopTimezone"
     
-    # Export UTC trace data
-    print("   📝 Writing UTC trace data...")
-    with open("order_trace_utc.json", "w") as f:
-        json.dump(trace_utc, f, indent=2, default=str)
+    if use_transposed:
+        # Create transposed view and write transposed file
+        print(f"   📋 Creating transposed reconciliation view...")
+        df_t = df.set_index("date").T
+        filename = f"transposed_reconciliation_{timezone_suffix}.csv"
+        print(f"   💾 Writing {filename}...")
+        df_t.to_csv(filename)
+        format_info = "transposed (dates in columns, metrics in rows)"
+    else:
+        # Write standard format
+        filename = f"daily_sales_reconciliation_{timezone_suffix}.csv"
+        print(f"   💾 Writing {filename}...")
+        df.to_csv(filename, index=False)
+        format_info = "standard (dates in rows, metrics in columns)"
     
-    # Create detailed transaction export for UTC
-    detailed_rows_utc = []
-    for date_str, transactions in detailed_transactions_utc.items():
-        for txn in transactions:
-            txn['date'] = date_str
-            detailed_rows_utc.append(txn)
-    
-    if detailed_rows_utc:
-        print("   📄 Writing detailed UTC transactions...")
-        detailed_df_utc = pd.DataFrame(detailed_rows_utc)
-        detailed_df_utc.to_csv("detailed_transactions_utc.csv", index=False)
-    
-    # Generate Shop timezone-aligned data (for debugging against Shopify reports)
-    print(f"   📊 Generating {SALES_TIMEZONE}-aligned data for Shopify report comparison...")
-    print(f"   🕐 NOTE: Payout transactions will be regrouped by {SALES_TIMEZONE} dates")
-    print(f"   ⚠️  Fee and Net amounts will be recalculated based on regrouped charges")
-    df_shop = generate_reconciliation_dataframe(by_date_shop, detailed_transactions_shop, payout_df, SALES_TIMEZONE)
-    print("   💾 Writing daily_sales_reconciliation_shop_timezone.csv...")
-    df_shop.to_csv("daily_sales_reconciliation_shop_timezone.csv", index=False)
-    
-    # Create transposed view for shop timezone data
-    print("   📋 Creating transposed shop timezone view...")
-    df_shop_t = df_shop.set_index("date").T
-    df_shop_t.to_csv("transposed_reconciliation_shop_timezone.csv")
-    
-    # Export shop timezone trace data
-    print(f"   📝 Writing {SALES_TIMEZONE} trace data...")
-    with open("order_trace_shop_timezone.json", "w") as f:
-        json.dump(trace_shop, f, indent=2, default=str)
-    
-    # Create detailed transaction export for shop timezone
-    print(f"   📊 Writing {SALES_TIMEZONE} detailed transactions...")
-    detailed_rows_shop = []
-    for date_str, transactions in detailed_transactions_shop.items():
-        for txn in transactions:
-            txn['date'] = date_str
-            detailed_rows_shop.append(txn)
-    
-    if detailed_rows_shop:
-        detailed_df_shop = pd.DataFrame(detailed_rows_shop)
-        detailed_df_shop.to_csv("detailed_transactions_shop_timezone.csv", index=False)
-    
-    # Also maintain backwards compatibility with original files (using UTC for payout reconciliation)
-    print("   📝 Writing UTC backward compatibility files...")
-    df_utc.to_csv("daily_sales_reconciliation_fixed.csv", index=False)
-    df_utc_t.to_csv("transposed_reconciliation_fixed.csv")
-    
-    print(f"\n✅ RECONCILIATION COMPLETE! Files generated:")
-    print(f"   📊 UTC (for accurate payout reconciliation):")
-    print(f"     • daily_sales_reconciliation_utc.csv")
-    print(f"     • transposed_reconciliation_utc.csv")
-    print(f"     • detailed_transactions_utc.csv")
-    print(f"     • order_trace_utc.json")
-    print(f"   📊 {SALES_TIMEZONE} (for Shopify report comparison):")
-    print(f"     • daily_sales_reconciliation_shop_timezone.csv")
-    print(f"     • transposed_reconciliation_shop_timezone.csv")
-    print(f"     • detailed_transactions_shop_timezone.csv")
-    print(f"     • order_trace_shop_timezone.json")
+    print(f"\n✅ RECONCILIATION COMPLETE! File generated:")
+    print(f"   📊 Timezone: {target_timezone}")
+    print(f"   📋 Format: {format_info}")
+    print(f"     • {filename}")
     print(f"   ")
-    print(f"   🕐 TIMEZONE DIFFERENCES:")
-    print(f"   • UTC files: Sales, payments, and payouts all in UTC timezone")
-    print(f"   • {SALES_TIMEZONE} files: Sales and payments in {SALES_TIMEZONE}, payouts regrouped to {SALES_TIMEZONE}")
-    print(f"   • For accurate reconciliation: Use UTC files")
-    print(f"   • For Shopify report comparison: Use {SALES_TIMEZONE} files")
-    print(f"\n📊 Run beautiful_mismatch_viewer.py to view Excel analysis!")
+    print(f"   🕐 TIMEZONE INFO:")
+    if use_utc_timezone:
+        print(f"   • All data grouped by UTC dates")
+        print(f"   • Payout transactions in original UTC timezone")
+        print(f"   • Recommended for accurate payout reconciliation")
+    else:
+        print(f"   • All data grouped by {SALES_TIMEZONE} dates")
+        print(f"   • Payout transactions converted to {SALES_TIMEZONE}")
+        print(f"   • Recommended for business reporting and Shopify report comparison")
     
-    return df_utc, df_shop
+    return df
 
 def generate_reconciliation_dataframe(by_date, detailed_transactions, payout_df, timezone_name):
     """Generate reconciliation dataframe for a specific timezone"""
@@ -762,6 +788,12 @@ if __name__ == "__main__":
         print("📁 Cache: DISABLED")
     print()
     
+    # Select timezone
+    use_utc_timezone, target_timezone, use_transposed = select_timezone_and_format()
+    if use_utc_timezone is None:
+        print("❌ No timezone selected. Exiting.")
+        sys.exit(1)
+    
     # Select payout CSV file
     selected_payout_file = select_payout_csv_file()
     if selected_payout_file is None:
@@ -772,7 +804,7 @@ if __name__ == "__main__":
     payout_df = load_payout_csv(selected_payout_file)
     print(f"   ✅ Loaded {len(payout_df)} payout transactions")
     
-    start_date, end_date = extract_utc_date_range(payout_df)
+    start_date, end_date = extract_date_range(payout_df, use_utc_timezone)
     print(f"📅 Reconciliation period: {start_date} to {end_date}")
 
     print("\n🛒 Fetching orders from Shopify GraphQL API...")
@@ -780,34 +812,62 @@ if __name__ == "__main__":
     print(f"   ✅ Retrieved {len(order_data)} orders total")
 
     print("\n🔄 Processing orders and calculating daily summaries...")
-    (by_date_utc, trace_utc, detailed_transactions_utc, 
-     by_date_shop, trace_shop, detailed_transactions_shop) = parse_orders(order_data)
+    by_date, detailed_transactions = parse_orders(order_data, use_utc_timezone, target_timezone)
     
-    print(f"   ✅ Processed orders for UTC timezone")
-    print(f"   ✅ Processed orders for {SALES_TIMEZONE} timezone")
+    print(f"   ✅ Processed orders for {target_timezone} timezone")
     
     print("\n💾 Writing output files and reconciling with payouts...")
-    df_utc, df_shop = write_outputs(by_date_utc, trace_utc, detailed_transactions_utc,
-                                   by_date_shop, trace_shop, detailed_transactions_shop, payout_df)
+    df = write_outputs(by_date, detailed_transactions, payout_df, use_utc_timezone, target_timezone, use_transposed)
     
-    print(f"\n📊 UTC Daily Summary Preview (for payout reconciliation):")
-    print(df_utc.head(10).to_string(index=False))
+    print(f"\n📊 Daily Summary Preview:")
+    print(df.head(10).to_string(index=False))
     
-    print(f"\n📊 {SALES_TIMEZONE} Daily Summary Preview (for Shopify report comparison):")
-    print(df_shop.head(10).to_string(index=False))
+    # Show summary statistics
+    total_sales = df['gross_sales'].sum()
+    print(f"\n🌍 Summary Statistics:")
+    print(f"Total sales ({target_timezone} grouping): ${total_sales:,.2f}")
+    print(f"Total orders: {df['order_count'].sum()}")
+    print(f"Date range: {df['date'].min()} to {df['date'].max()}")
     
-    # Show timezone impact summary
-    utc_total = df_utc['gross_sales'].sum()
-    shop_total = df_shop['gross_sales'].sum()
-    print(f"\n🌍 Timezone Impact Summary:")
-    print(f"Total sales (UTC grouping): ${utc_total:,.2f}")
-    print(f"Total sales ({SALES_TIMEZONE} grouping): ${shop_total:,.2f}")
-    print(f"Difference: ${shop_total - utc_total:,.2f}")
+    # Count mismatches
+    mismatches = df['mismatch'].sum()
+    print(f"Mismatches found: {mismatches}")
     
-    # Count mismatches in both datasets
-    utc_mismatches = df_utc['mismatch'].sum()
-    shop_mismatches = df_shop['mismatch'].sum()
-    print(f"\nMismatches in UTC data: {utc_mismatches}")
-    print(f"Mismatches in {SALES_TIMEZONE} data: {shop_mismatches}")
+    print("✅ Reconciliation complete.")
+def select_timezone():
+    """Allow user to select timezone for reconciliation"""
+    print(f"\n🌍 SELECT TIMEZONE FOR RECONCILIATION")
+    print(f"=" * 45)
+    print(f"Choose the timezone for grouping sales and payout data:\n")
     
-    print("✅ Dual-timezone reconciliation complete.")
+    print(f"1. UTC (Recommended for payout reconciliation)")
+    print(f"   • All data grouped by UTC dates")
+    print(f"   • Payout transactions in original UTC timezone")
+    print(f"   • Most accurate for matching Shopify payouts")
+    print()
+    
+    print(f"2. Shop Timezone ({SALES_TIMEZONE})")
+    print(f"   • All data grouped by {SALES_TIMEZONE} dates")
+    print(f"   • Payout transactions converted to {SALES_TIMEZONE}")
+    print(f"   • Better for business reporting and Shopify report comparison")
+    print()
+    
+    while True:
+        try:
+            choice = input("Enter your choice (1-2): ").strip()
+            
+            if choice == "1":
+                print(f"\n✅ Selected: UTC timezone")
+                return True, "UTC"
+            elif choice == "2":
+                print(f"\n✅ Selected: {SALES_TIMEZONE} timezone")
+                return False, SALES_TIMEZONE
+            else:
+                print("❌ Please enter 1 or 2")
+                
+        except KeyboardInterrupt:
+            print("\n🚪 Cancelled by user")
+            return None, None
+        except Exception as e:
+            print(f"❌ Error: {e}")
+            return None, None
