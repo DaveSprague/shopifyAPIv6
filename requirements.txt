@@ -4,6 +4,7 @@ python-dotenv==1.0.1
 pandas==2.2.2
 requests==2.31.0
 numpy>=1.21.0
+pytz>=2023.3
 
 # Excel formatting and export
 openpyxl>=3.1.0
