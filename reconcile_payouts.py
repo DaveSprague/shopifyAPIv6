@@ -534,6 +534,7 @@ def parse_orders(order_data, use_utc_timezone, target_timezone):
         order_info_by_date[date_str].append({ 
             'name': order['name'],
             'created_at': created_dt.isoformat(),
+            'processed_at': processed_dt.isoformat(),
             'created_datetime': created_dt
         })
 
@@ -948,8 +949,8 @@ def main():
     print("\n💾 Writing output files and reconciling with payouts...")
     df = write_outputs(by_date, detailed_transactions, order_info_by_date, payout_df, use_utc_timezone, target_timezone, use_transposed)
     
-    print(f"\n📊 Daily Summary Preview:")
-    print(df.head(10).to_string(index=False))
+    # print(f"\n📊 Daily Summary Preview:")
+    # print(df.head(10).to_string(index=False))
     
     # Show summary statistics
     total_sales = df['sales_net_sales'].sum()
