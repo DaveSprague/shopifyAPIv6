@@ -551,6 +551,20 @@ def parse_orders(order_data, use_utc_timezone, target_timezone, payout_mapping=N
         total_received = float(order['totalReceivedSet']['presentmentMoney']['amount'])
         total_received_chk = net_payment_chk + order_refunds
 
+        # Determine source/location combination for sales breakdown
+        source_name = order.get('sourceName', 'unknown')
+        retail_location = order.get('retailLocation', {})
+        location_name = retail_location.get('name', '') if retail_location else ''
+        
+        # Create source/location key - combine source and location into single identifier
+        if location_name:
+            source_location_key = f"{source_name}_{location_name}"
+        else:
+            source_location_key = source_name
+        
+        # Clean up the key to make it CSV-friendly
+        source_location_key = source_location_key.replace(' ', '_').replace(',', '_').replace('/', '_').lower()
+
         # Store order data to be allocated to payout dates
         order_data_for_allocation = {
             'gross_sales': gross_sales,
@@ -566,6 +580,14 @@ def parse_orders(order_data, use_utc_timezone, target_timezone, payout_mapping=N
             'total_received': total_received,
             'total_received_chk': total_received_chk,
             'calculated_total': gross_sales + tax + shipping + tips - discounts,
+            # Source/location breakdown for sales metrics
+            f'source_{source_location_key}_gross_sales': gross_sales,
+            f'source_{source_location_key}_net_sales': net_sales,
+            f'source_{source_location_key}_discounts': discounts,
+            f'source_{source_location_key}_tax': tax,
+            f'source_{source_location_key}_shipping': shipping,
+            f'source_{source_location_key}_tips': tips,
+            f'source_{source_location_key}_order_count': 1
         }
 
         # PAYOUT-CENTRIC APPROACH: Process transactions to find payout dates
@@ -762,9 +784,26 @@ def write_outputs(by_date, detailed_transactions, order_info_by_date, payout_df,
     
     return df
 
+def collect_source_location_combinations(by_date):
+    """Collect all unique source/location combinations from the data"""
+    source_location_keys = set()
+    
+    for date_str, metrics in by_date.items():
+        for key in metrics.keys():
+            if key.startswith('source_') and key.endswith('_gross_sales'):
+                # Extract source_location_key from the metric name
+                source_location_key = key.replace('source_', '').replace('_gross_sales', '')
+                source_location_keys.add(source_location_key)
+    
+    return sorted(source_location_keys)
+
 def generate_reconciliation_dataframe(by_date, detailed_transactions, order_info_by_date, payout_df, timezone_name):
-    """Generate reconciliation dataframe for a specific timezone"""
+    """Generate reconciliation dataframe for a specific timezone with separate rows for each source/location"""
     df_rows = []
+    
+    # Collect all source/location combinations to create consistent rows
+    source_location_combinations = collect_source_location_combinations(by_date)
+    print(f"   Found {len(source_location_combinations)} source/location combinations: {source_location_combinations}")
     
     # Convert payout dates to the specified timezone if not UTC
     if timezone_name != "UTC":
