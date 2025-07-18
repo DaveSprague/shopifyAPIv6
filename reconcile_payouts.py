@@ -11,6 +11,9 @@ import hashlib
 import pickle
 import time
 
+# TODO: the sales metrics still aren't matching up quite correctly.  Gross and Net Sales calculations need to be reviewed.
+# TODO: Add some more recinciliation tests to verify the sales, payments, and payouts are all matching up correctly.
+
 # Load environment variables
 load_dotenv()
 SHOPIFY_STORE = os.getenv("SHOPIFY_STORE")
@@ -387,7 +390,6 @@ query getOrders($cursor: String, $queryString: String) {
                 totalRefundedSet { presentmentMoney { amount currencyCode } }
                 subtotalPriceSet { shopMoney { amount currencyCode } }
                 totalTipReceivedSet { presentmentMoney { amount currencyCode } }
-                totalReceivedSet { presentmentMoney { amount currencyCode } }
                 totalDiscountsSet { presentmentMoney { amount currencyCode } }
                 netPaymentSet { presentmentMoney { amount currencyCode } }
                 subtotalPriceSet { presentmentMoney { amount currencyCode } }
@@ -526,7 +528,7 @@ def parse_orders(order_data, use_utc_timezone, target_timezone, payout_mapping=N
     print(f"   PAYOUT-CENTRIC APPROACH: Grouping orders by payout dates")
     if payout_mapping:
         print(f"   Using payout-based grouping for {len(payout_mapping)} Shopify Payment transactions")
-        print(f"   Supporting all payment methods: Shopify Payments, Cash, Manual, Gift Card, Shop Cash")
+        print(f"   Supporting all payment methods: Shopify Payments (incl. manual), Cash, Gift Card, Shop Cash")
         print(f"   Credit card orders grouped by payout date, other payments by processedAt date")
 
     for order in order_data:
@@ -538,18 +540,22 @@ def parse_orders(order_data, use_utc_timezone, target_timezone, payout_mapping=N
         processed_date = processed_dt.date()
         
         # Basic order totals - all essential fields are guaranteed to exist
-        net_sales = float(order['subtotalPriceSet']['presentmentMoney']['amount'])  # This is the gross sales before discounts
-        discounts = -float(order['totalDiscountsSet']['presentmentMoney']['amount'])
-        gross_sales =  net_sales - discounts  # Net sales after discounts (discounts are typically negative)
+        # subtotalPriceSet is the gross sales (before discounts)
+        # totalDiscountsSet is the discount amount (positive value)
+        # Net sales = gross sales - discounts
+        gross_sales = float(order['subtotalPriceSet']['presentmentMoney']['amount'])  # This is gross sales before discounts
+        discounts = float(order['totalDiscountsSet']['presentmentMoney']['amount'])  # This is discount amount (positive)
+        net_sales = gross_sales  # Net sales after discounts are subtracted
+        gross_sales = net_sales + discounts  # Recalculate gross sales for clarity
         tax = float(order['totalTaxSet']['presentmentMoney']['amount'])
         shipping = float(order['totalShippingPriceSet']['presentmentMoney']['amount'])
         tips = float(order['totalTipReceivedSet']['presentmentMoney']['amount'])
         net_payment = float(order['netPaymentSet']['presentmentMoney']['amount'])
-        net_payment_chk = net_sales + tax + shipping + tips
         order_refunds = float(order['totalRefundedSet']['presentmentMoney']['amount'])
         outstanding = float(order['totalOutstandingSet']['presentmentMoney']['amount'])
-        total_received = float(order['totalReceivedSet']['presentmentMoney']['amount'])
-        total_received_chk = net_payment_chk + order_refunds
+        
+        # Calculate funds that should be collected (theoretical amount)
+        funds_collected = net_sales + tax + shipping + tips
 
         # Store order data to be allocated to payout dates
         order_data_for_allocation = {
@@ -561,11 +567,8 @@ def parse_orders(order_data, use_utc_timezone, target_timezone, payout_mapping=N
             'tips': tips,
             'order_refunds': order_refunds,
             'net_payment': net_payment,
-            'net_payment_chk': net_payment_chk,
             'outstanding': outstanding,
-            'total_received': total_received,
-            'total_received_chk': total_received_chk,
-            'calculated_total': gross_sales + tax + shipping + tips - discounts,
+            'funds_collected': funds_collected,  # This is the theoretical amount that should be collected
         }
 
         # PAYOUT-CENTRIC APPROACH: Process transactions to find payout dates
@@ -606,7 +609,7 @@ def parse_orders(order_data, use_utc_timezone, target_timezone, payout_mapping=N
                         break
             
             # Check for cash transactions and other payment methods that use processedAt date
-            elif gateway in ['cash', 'manual', 'gift_card', 'shop_cash'] and kind in ['SALE']:
+            elif gateway in ['cash', 'gift_card', 'shop_cash'] and kind in ['SALE']:
                 order_has_cash_payment = True
                 # For these payment methods, use the processedAt date as the payout date
                 if not order_payout_date:  # Only set if we don't already have a payout date from credit card
@@ -656,7 +659,7 @@ def parse_orders(order_data, use_utc_timezone, target_timezone, payout_mapping=N
                 final_date_str = order_payout_date
                 use_payout_date = True
             # For cash and other payment methods, use processedAt date as payout date
-            elif gateway in ['cash', 'manual', 'gift_card', 'shop_cash']:
+            elif gateway in ['cash', 'gift_card', 'shop_cash']:
                 final_date_str = str(txn_date)  # Use the transaction's processedAt date
                 use_payout_date = False  # This is actually using processed date, not payout date
             else:
@@ -682,9 +685,9 @@ def parse_orders(order_data, use_utc_timezone, target_timezone, payout_mapping=N
                     by_date[final_date_str]['cash_refunds'] += amount
             elif gateway == 'manual':
                 if kind == 'SALE':
-                    by_date[final_date_str]['manual'] += amount
+                    by_date[final_date_str]['shopify_payments'] += amount
                 elif kind == 'REFUND':
-                    by_date[final_date_str]['manual_refunds'] += amount
+                    by_date[final_date_str]['shopify_payments_refunds'] += amount
             elif gateway == 'gift_card':
                 if kind == 'SALE':
                     by_date[final_date_str]['gift_card'] += amount
@@ -743,9 +746,8 @@ def write_outputs(by_date, detailed_transactions, order_info_by_date, payout_df,
     print(f"     • {filename}")
     print(f"   ")
     print(f"   PAYOUT-CENTRIC APPROACH:")
-    print(f"   • Credit Card Orders (Shopify Payments): Grouped by payout date (matches bank deposits)")
+    print(f"   • Credit Card Orders (Shopify Payments & Manual): Grouped by payout date (matches bank deposits)")
     print(f"   • Cash Orders: Grouped by processedAt date (immediate payout)")
-    print(f"   • Manual Orders: Grouped by processedAt date (immediate payout)")
     print(f"   • Gift Card Orders: Grouped by processedAt date (immediate payout)")
     print(f"   • Shop Cash Orders: Grouped by processedAt date (immediate payout)")
     print(f"   • ALL PAYMENT METHODS: Now included in comprehensive reconciliation")
@@ -789,59 +791,79 @@ def generate_reconciliation_dataframe(by_date, detailed_transactions, order_info
         metrics = by_date.get(date_str, defaultdict(float))
         orders_info = order_info_by_date.get(date_str, [])
         
-        # === SHARED DATA FOR ALL ROWS ===
+        row = {"date": date_str, "timezone": timezone_name}
+        
         # Order tracking info - earliest and latest orders
         if orders_info:
             sorted_orders = sorted(orders_info, key=lambda x: x['created_datetime'])
             earliest_order = sorted_orders[0]
             latest_order = sorted_orders[-1]
             
-            order_info = {
+            row.update({
                 'earliest_order_name': earliest_order['name'],
                 'earliest_order_created_at': earliest_order['created_at'],
                 'latest_order_name': latest_order['name'],
                 'latest_order_created_at': latest_order['created_at'],
                 'order_count': len(orders_info),
-            }
+            })
         else:
-            order_info = {
+            row.update({
                 'earliest_order_name': '',
                 'earliest_order_created_at': '',
                 'latest_order_name': '',
                 'latest_order_created_at': '',
                 'order_count': 0,
-            }
+            })
         
-        # === PAYMENT AND PAYOUT DATA (SHARED) ===
+        # === SALES SECTION ===
+        gross_sales = metrics.get('gross_sales', 0)  # This is from subtotalPriceSet (gross sales before discounts)
+        discounts = metrics.get('discounts', 0)  # This is discount amount (positive value)
+        net_sales = metrics.get('net_sales', 0)  # This is gross_sales - discounts (net sales after discounts)
+        tax = metrics.get('tax', 0)
+        shipping = metrics.get('shipping', 0)
+        tips = metrics.get('tips', 0)
+        funds_collected = metrics.get('funds_collected', 0)
+        
+        # Overall sales totals
+        row.update({
+            'sales_gross_sales': gross_sales,
+            'sales_discounts': -discounts,  # Display discounts as negative numbers for reporting
+            'sales_net_sales': net_sales,
+            'sales_tax': tax,
+            'sales_shipping': shipping,
+            'sales_tips': tips,
+            'sales_funds_collected': funds_collected,  # Theoretical amount (net + tax + shipping + tips)
+            'sales_order_count': metrics.get('order_count', 0),
+        })
+        
+        # === PAYMENTS SECTION ===
         # Payment gateway breakdown with exact matching
-        payments_data = {
-            'payments_shopify_payments': metrics.get('shopify_payments', 0),
+        row.update({
+            'payments_shopify_payments': metrics.get('shopify_payments', 0),  # Includes manual payments
             'payments_cash': metrics.get('cash', 0),
-            'payments_manual': metrics.get('manual', 0),  # Manual credit card entries
             'payments_gift_card': metrics.get('gift_card', 0),
             'payments_shop_cash': metrics.get('shop_cash', 0),
             'payments_other': metrics.get('other_payments', 0),
-        }
+        })
         
         # Refunds by payment type
-        refunds_data = {
-            'payments_shopify_refunds': metrics.get('shopify_payments_refunds', 0),
+        row.update({
+            'payments_shopify_refunds': metrics.get('shopify_payments_refunds', 0),  # Includes manual refunds
             'payments_cash_refunds': metrics.get('cash_refunds', 0),
-            'payments_manual_refunds': metrics.get('manual_refunds', 0),
             'payments_gift_card_refunds': metrics.get('gift_card_refunds', 0),
             'payments_shop_cash_refunds': metrics.get('shop_cash_refunds', 0),
             'payments_other_refunds': metrics.get('other_refunds', 0),
-        }
+        })
         
         # Special cash handling
-        cash_data = {
+        row.update({
             'payments_cash_change': metrics.get('cash_change', 0),  # Cash change given
-        }
+        })
         
         # Total refunds from orders (this is the aggregate from order totals)
-        refunds_total = {
+        row.update({
             'payments_total_refunds': metrics.get('order_refunds', 0),
-        }
+        })
         
         # === SHOPIFY PAYOUTS SECTION ===
         # Payout data reconciliation using timezone-converted dates
@@ -852,8 +874,8 @@ def generate_reconciliation_dataframe(by_date, detailed_transactions, order_info
         payout_day_paid = payout_day[payout_day['Payout Status'] == 'paid']
         
         # Separate payout data by type (only for paid transactions)
-        payout_charges = payout_day_paid[payout_day_paid['Type'] == 'charge']
         payout_refunds = payout_day_paid[payout_day_paid['Type'] == 'refund']
+        payout_charges = payout_day_paid[payout_day_paid['Type'] == 'charge'] - payout_refunds
         payout_adjustments = payout_day_paid[payout_day_paid['Type'] == 'adjustment']
         payout_chargebacks = payout_day_paid[payout_day_paid['Type'] == 'chargeback']
         payout_chargebacks_won = payout_day_paid[payout_day_paid['Type'] == 'chargeback won']
@@ -861,20 +883,22 @@ def generate_reconciliation_dataframe(by_date, detailed_transactions, order_info
         payout_other = payout_day_paid[~payout_day_paid['Type'].isin(['charge', 'refund', 'adjustment', 'chargeback', 'chargeback won', 'shop_cash_credit'])]
         
         # Calculate Shopify payout metrics
-        shopify_payout_refunds = abs(payout_refunds['Payout Amount'].sum())  # Make refunds positive
-        shopify_amount_before_fees = payout_charges['Payout Amount'].sum()
+        shopify_pmts_w_refunds = payout_charges['Payout Amount'].sum()
+        shopify_payout_refunds = payout_refunds['Payout Amount'].sum()  # Make refunds positive
+        shopify_payments = shopify_pmts_w_refunds - shopify_payout_refunds  # Net payments after refunds
         shopify_fees = payout_day_paid['Payout Fee'].sum()
         shopify_net_deposit = payout_day_paid['Payout Net Deposit'].sum()
         
-        payout_data = {
+        row.update({
+            'shopify_payments_amount': shopify_payments,
             'shopify_payout_refunds': shopify_payout_refunds,
-            'shopify_amount_before_fees': shopify_amount_before_fees,
-            'shopify_fees': shopify_fees,
+            'shopify_pymt_amount_w_refunds': shopify_pmts_w_refunds,  # This is the gross amount being paid out
+            'shopify_fees': - shopify_fees,
             'shopify_net_deposit': shopify_net_deposit,
-        }
+        })
         
         # Additional metrics for detailed analysis (optional, can be removed later)
-        payout_details = {
+        row.update({
             'payout_count': len(payout_day_paid),
             'payout_statuses': ", ".join(sorted(payout_day_paid['Payout Status'].unique())) if len(payout_day_paid) > 0 else "",
             'payout_types': ", ".join(sorted(payout_day_paid['Type'].unique())) if len(payout_day_paid) > 0 else "",
@@ -886,111 +910,34 @@ def generate_reconciliation_dataframe(by_date, detailed_transactions, order_info
             # Track pending transactions separately for visibility
             'pending_payout_amount': payout_day[payout_day['Payout Status'] != 'paid']['Payout Amount'].sum(),
             'pending_payout_count': len(payout_day[payout_day['Payout Status'] != 'paid']),
-        }
+        })
 
         # === RECONCILIATION ANALYSIS ===
         # Use the new metric names for reconciliation calculations
-        shopify_handled = payments_data['payments_shopify_payments']  # Shopify payments from transactions
-        shopify_payout_refunds_amount = payout_data['shopify_payout_refunds']  # Refunds from payout data
-        shopify_amount_before_fees = payout_data['shopify_amount_before_fees']  # Charges from payout data
-        shopify_fees = payout_data['shopify_fees']  # Fees from payout data
-        shopify_net_deposit = payout_data['shopify_net_deposit']  # Net deposit from payout data
+        shopify_payments = row['shopify_payments_amount']  # Shopify payments from transactions
+        shopify_payment_refunds = row['shopify_payout_refunds']  # Refunds from payout data
+        shopify_pmts_w_refunds = row['shopify_pymt_amount_w_refunds']  # Charges from payout data
+        shopify_fees = row['shopify_fees']  # Fees from payout data
+        shopify_net_deposit = row['shopify_net_deposit']  # Net deposit from payout data
         
         # CORRECTED RECONCILIATION LOGIC:
         # Compare apples to apples:
         # - Order side: Total Shopify Payments from orders (net of refunds)
         # - Payout side: Total payout charges before fees (gross amount being paid out)
-        total_shopify_receipts = shopify_handled  # This is already net of refunds from order processing
-        expected_payout_amount = shopify_amount_before_fees  # This is the gross payout amount before fees
+        expected_payout_amount = shopify_pmts_w_refunds  # This is the gross payout amount before fees
         
         # Check if amounts match (within 1 cent tolerance) - only for days with paid payouts
-        mismatch = abs(total_shopify_receipts - expected_payout_amount) > 0.01 if expected_payout_amount > 0 else False
+        mismatch = abs(shopify_pmts_w_refunds - expected_payout_amount) > 0.01 if expected_payout_amount > 0 else False
         
-        reconciliation_data = {
-            'reconciliation_difference': total_shopify_receipts - expected_payout_amount,
+        row.update({
+            'reconciliation_difference': shopify_pmts_w_refunds - expected_payout_amount,
             'reconciliation_mismatch': mismatch,
-            'reconciliation_percentage': (expected_payout_amount / total_shopify_receipts * 100) if total_shopify_receipts != 0 else 0,
-            'reconciliation_total_receipts': total_shopify_receipts,  # Add this for transparency
+            'reconciliation_total_receipts': shopify_pmts_w_refunds,  # Add this for transparency
             'reconciliation_expected_payout': expected_payout_amount,  # Add this for transparency
             'reconciliation_timezone_note': f"Payout dates converted to {timezone_name}" if timezone_name != "UTC" else "Original UTC dates"
-        }
+        })
         
-        # === CREATE OVERALL TOTALS ROW ===
-        # Calculate overall totals for this date
-        gross_sales = metrics.get('gross_sales', 0)  # This is from subtotalPriceSet (gross sales before discounts)
-        discounts = metrics.get('discounts', 0)  # This is typically positive from Shopify API
-        net_sales = metrics.get('net_sales', 0)  # This is gross_sales + discounts (net sales after discounts)
-        tax = metrics.get('tax', 0)
-        shipping = metrics.get('shipping', 0)
-        tips = metrics.get('tips', 0)
-        total_received = metrics.get('total_received', 0)
-        
-        # Calculate Funds Collected = Net Sales + Tax + Shipping + Tips
-        # Note: net_sales already includes discounts (gross_sales + discounts where discounts are negative)
-        # So funds_collected = net_sales + tax + shipping + tips
-        funds_collected = net_sales + tax + shipping + tips
-        
-        # Create overall totals row
-        overall_row = {
-            "date": date_str, 
-            "timezone": timezone_name,
-            "source_location": "TOTAL",  # Indicates this is the overall total
-            'sales_gross_sales': gross_sales,
-            'sales_discounts': -abs(discounts),  # Make discounts appear as negative numbers
-            'sales_net_sales': net_sales,
-            'sales_tax': tax,
-            'sales_shipping': shipping,
-            'sales_tips': tips,
-            'sales_total_received': total_received,
-            'sales_funds_collected': funds_collected,
-            'sales_order_count': metrics.get('order_count', 0),
-        }
-        
-        # Add shared data to overall row
-        overall_row.update(order_info)
-        overall_row.update(payments_data)
-        overall_row.update(refunds_data)
-        overall_row.update(cash_data)
-        overall_row.update(refunds_total)
-        overall_row.update(payout_data)
-        overall_row.update(payout_details)
-        overall_row.update(reconciliation_data)
-        
-        df_rows.append(overall_row)
-        
-        # === CREATE INDIVIDUAL SOURCE/LOCATION ROWS ===
-        # Create separate rows for each source/location combination
-        for source_location_key in source_location_combinations:
-            source_location_row = {
-                "date": date_str,
-                "timezone": timezone_name,
-                "source_location": source_location_key,  # This identifies the specific source/location
-                'sales_gross_sales': metrics.get(f'source_{source_location_key}_gross_sales', 0),
-                'sales_discounts': -abs(metrics.get(f'source_{source_location_key}_discounts', 0)),
-                'sales_net_sales': metrics.get(f'source_{source_location_key}_net_sales', 0),
-                'sales_tax': metrics.get(f'source_{source_location_key}_tax', 0),
-                'sales_shipping': metrics.get(f'source_{source_location_key}_shipping', 0),
-                'sales_tips': metrics.get(f'source_{source_location_key}_tips', 0),
-                'sales_total_received': 0,  # Not tracked per source/location
-                'sales_funds_collected': (metrics.get(f'source_{source_location_key}_net_sales', 0) + 
-                                        metrics.get(f'source_{source_location_key}_tax', 0) + 
-                                        metrics.get(f'source_{source_location_key}_shipping', 0) + 
-                                        metrics.get(f'source_{source_location_key}_tips', 0)),
-                'sales_order_count': metrics.get(f'source_{source_location_key}_order_count', 0),
-            }
-            
-            # Add shared data to source/location row (but zero out values that don't apply to individual source/locations)
-            source_location_row.update(order_info)
-            # Payment and payout data should be zero for individual source/location rows since they're not tracked per source
-            source_location_row.update({k: 0 for k in payments_data.keys()})
-            source_location_row.update({k: 0 for k in refunds_data.keys()})
-            source_location_row.update({k: 0 for k in cash_data.keys()})
-            source_location_row.update({k: 0 for k in refunds_total.keys()})
-            source_location_row.update({k: 0 for k in payout_data.keys()})
-            source_location_row.update({k: 0 if isinstance(v, (int, float)) else '' for k, v in payout_details.items()})
-            source_location_row.update({k: 0 if isinstance(v, (int, float)) else False if isinstance(v, bool) else '' for k, v in reconciliation_data.items()})
-            
-            df_rows.append(source_location_row)
+        df_rows.append(row)
 
     # Create DataFrame
     df = pd.DataFrame(df_rows).sort_values(by="date")
@@ -1117,9 +1064,8 @@ def main():
     print(f"Total orders: {df['order_count'].sum()}")
     print(f"Date range: {df['date'].min()} to {df['date'].max()}")
     
-    # Count mismatches - only count from TOTAL rows since individual source/location rows have False/empty values
-    total_rows = df[df['source_location'] == 'TOTAL']
-    mismatches = (total_rows['reconciliation_mismatch'] == True).sum()  # Count True values
+    # Count mismatches
+    mismatches = (df['reconciliation_mismatch'] == True).sum()  # Count True values
     print(f"Mismatches found: {mismatches}")
     
     print("Reconciliation complete.")
