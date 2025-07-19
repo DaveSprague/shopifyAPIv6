@@ -330,6 +330,13 @@ def manage_cache():
 
 # Load payout transactions CSV
 def load_payout_csv(filepath):
+    """
+    Load and normalize payout transaction CSV data.
+    IMPORTANT: The 'Amount' column in the payout CSV already includes both charges and refunds,
+    with refunds already subtracted out. This means:
+    - Positive amounts are net charges (charges minus any refunds for that payout date)
+    - We don't need to separate charges and refunds and recombine them
+    """
     df = pd.read_csv(filepath)
     df['Payout Date'] = pd.to_datetime(df['Payout Date'], utc=True)
     df['Transaction Date'] = pd.to_datetime(df['Transaction Date'], errors='coerce', utc=True)
@@ -676,28 +683,28 @@ def parse_orders(order_data, use_utc_timezone, target_timezone, payout_mapping=N
                 elif kind == 'SALE':
                     by_date[final_date_str]['shopify_payments'] += amount
                 elif kind == 'REFUND':
-                    by_date[final_date_str]['shopify_payments_refunds'] += amount
+                    by_date[final_date_str]['shopify_payments_refunds'] -= amount
                 # Note: CAPTURE is ignored to avoid double-counting with AUTHORIZATION
             elif gateway == 'cash':
                 if kind == 'SALE':
                     by_date[final_date_str]['cash'] += amount
                 elif kind == 'REFUND':
-                    by_date[final_date_str]['cash_refunds'] += amount
+                    by_date[final_date_str]['cash_refunds'] -= amount
             elif gateway == 'manual':
                 if kind == 'SALE':
                     by_date[final_date_str]['shopify_payments'] += amount
                 elif kind == 'REFUND':
-                    by_date[final_date_str]['shopify_payments_refunds'] += amount
+                    by_date[final_date_str]['shopify_payments_refunds'] -= amount
             elif gateway == 'gift_card':
                 if kind == 'SALE':
                     by_date[final_date_str]['gift_card'] += amount
                 elif kind == 'REFUND':
-                    by_date[final_date_str]['gift_card_refunds'] += amount
+                    by_date[final_date_str]['gift_card_refunds'] -= amount
             elif gateway == 'shop_cash':
                 if kind in ['AUTHORIZATION', 'SALE']:
                     by_date[final_date_str]['shop_cash'] += amount
                 elif kind == 'REFUND':
-                    by_date[final_date_str]['shop_cash_refunds'] += amount
+                    by_date[final_date_str]['shop_cash_refunds'] -= amount
             
             # Store detailed transaction info
             detailed_transactions[final_date_str].append({
@@ -874,8 +881,9 @@ def generate_reconciliation_dataframe(by_date, detailed_transactions, order_info
         payout_day_paid = payout_day[payout_day['Payout Status'] == 'paid']
         
         # Separate payout data by type (only for paid transactions)
+        # NOTE: Amount column already has refunds netted out, so we don't need to separate and recombine
         payout_refunds = payout_day_paid[payout_day_paid['Type'] == 'refund']
-        payout_charges = payout_day_paid[payout_day_paid['Type'] == 'charge'] - payout_refunds
+        payout_charges = payout_day_paid[payout_day_paid['Type'] == 'charge']
         payout_adjustments = payout_day_paid[payout_day_paid['Type'] == 'adjustment']
         payout_chargebacks = payout_day_paid[payout_day_paid['Type'] == 'chargeback']
         payout_chargebacks_won = payout_day_paid[payout_day_paid['Type'] == 'chargeback won']
@@ -883,17 +891,19 @@ def generate_reconciliation_dataframe(by_date, detailed_transactions, order_info
         payout_other = payout_day_paid[~payout_day_paid['Type'].isin(['charge', 'refund', 'adjustment', 'chargeback', 'chargeback won', 'shop_cash_credit'])]
         
         # Calculate Shopify payout metrics
-        shopify_pmts_w_refunds = payout_charges['Payout Amount'].sum()
-        shopify_payout_refunds = payout_refunds['Payout Amount'].sum()  # Make refunds positive
-        shopify_payments = shopify_pmts_w_refunds - shopify_payout_refunds  # Net payments after refunds
-        shopify_fees = payout_day_paid['Payout Fee'].sum()
-        shopify_net_deposit = payout_day_paid['Payout Net Deposit'].sum()
+        # Since Amount already has refunds netted out, use total Amount for all charge+refund transactions
+        charge_and_refund_transactions = payout_day_paid[payout_day_paid['Type'].isin(['charge', 'refund'])]
+        shopify_net_payments = charge_and_refund_transactions['Payout Amount'].sum()  # This is already net of refunds
+        shopify_payout_refunds = abs(payout_refunds['Payout Amount'].sum())  # Track refunds separately for reporting
+        shopify_gross_charges = payout_charges['Payout Amount'].sum()  # Gross charges before refunds
+        shopify_fees = payout_day_paid['Payout Fee'].sum()  # Use 'Payout Fee' column
+        shopify_net_deposit = payout_day_paid['Payout Net Deposit'].sum()  # Use 'Payout Net Deposit' column
         
         row.update({
-            'shopify_payments_amount': shopify_payments,
-            'shopify_payout_refunds': shopify_payout_refunds,
-            'shopify_pymt_amount_w_refunds': shopify_pmts_w_refunds,  # This is the gross amount being paid out
-            'shopify_fees': - shopify_fees,
+            'shopify_payments_amount': shopify_net_payments,  # Net payments (already includes refunds)
+            'shopify_payout_refunds': shopify_payout_refunds,  # Refunds for reporting
+            'shopify_gross_charges': shopify_gross_charges,  # Gross charges before refunds
+            'shopify_fees': -shopify_fees,  # Negative for reporting (cost)
             'shopify_net_deposit': shopify_net_deposit,
         })
         
@@ -913,28 +923,59 @@ def generate_reconciliation_dataframe(by_date, detailed_transactions, order_info
         })
 
         # === RECONCILIATION ANALYSIS ===
-        # Use the new metric names for reconciliation calculations
-        shopify_payments = row['shopify_payments_amount']  # Shopify payments from transactions
-        shopify_payment_refunds = row['shopify_payout_refunds']  # Refunds from payout data
-        shopify_pmts_w_refunds = row['shopify_pymt_amount_w_refunds']  # Charges from payout data
+        # Use the corrected metric names for reconciliation calculations
+        # CRITICAL FIX: Order side must be NET payments (gross charges minus refunds)
+        # to match the payout side which already has refunds netted out
+        order_side_gross_payments = row['payments_shopify_payments']  # Gross Shopify payments from order transactions (includes manual)
+        order_side_refunds = row['payments_shopify_refunds']  # Refunds from order transactions (includes manual)
+        order_side_net_payments = order_side_gross_payments - order_side_refunds  # Net payments after refunds
+        
+        payout_side_net_payments = row['shopify_payments_amount']  # Net payments from payout CSV (Amount column, already net of refunds)
         shopify_fees = row['shopify_fees']  # Fees from payout data
         shopify_net_deposit = row['shopify_net_deposit']  # Net deposit from payout data
         
         # CORRECTED RECONCILIATION LOGIC:
-        # Compare apples to apples:
-        # - Order side: Total Shopify Payments from orders (net of refunds)
-        # - Payout side: Total payout charges before fees (gross amount being paid out)
-        expected_payout_amount = shopify_pmts_w_refunds  # This is the gross payout amount before fees
+        # The payout CSV Amount column already has refunds netted out, so we compare:
+        # - Order side: NET Shopify + Manual payments (gross charges minus refunds)
+        # - Payout side: NET payment amount from CSV (Amount column, which includes both charges and refunds)
         
         # Check if amounts match (within 1 cent tolerance) - only for days with paid payouts
-        mismatch = abs(shopify_pmts_w_refunds - expected_payout_amount) > 0.01 if expected_payout_amount > 0 else False
+        mismatch = abs(order_side_net_payments - payout_side_net_payments) > 0.01 if payout_side_net_payments != 0 else False
+        
+        # === ADDITIONAL RECONCILIATION CHECKS ===
+        
+        # 1. Sales vs Total Payments Reconciliation
+        # Calculate total payments received across all payment methods (gross)
+        total_payments_gross = (row['payments_shopify_payments'] + row['payments_cash'] + 
+                               row['payments_gift_card'] + row['payments_shop_cash'])
+        
+        # Calculate total refunds across all payment methods
+        total_refunds_all = (row['payments_shopify_refunds'] + row['payments_cash_refunds'] + 
+                            row['payments_gift_card_refunds'] + row['payments_shop_cash_refunds'])
+        
+        # Calculate net payments across all methods
+        total_payments_net = total_payments_gross - total_refunds_all
+        
+        # Expected amount to collect (sales + tax + shipping + tips)
+        expected_funds_collected = row['sales_funds_collected']
+        
+        # Check if sales funds match total payments received
+        sales_vs_payments_diff = expected_funds_collected - total_payments_net
+        sales_vs_payments_mismatch = abs(sales_vs_payments_diff) > 0.01 if expected_funds_collected != 0 else False
         
         row.update({
-            'reconciliation_difference': shopify_pmts_w_refunds - expected_payout_amount,
+            'reconciliation_difference': order_side_net_payments - payout_side_net_payments,
             'reconciliation_mismatch': mismatch,
-            'reconciliation_total_receipts': shopify_pmts_w_refunds,  # Add this for transparency
-            'reconciliation_expected_payout': expected_payout_amount,  # Add this for transparency
-            'reconciliation_timezone_note': f"Payout dates converted to {timezone_name}" if timezone_name != "UTC" else "Original UTC dates"
+            'reconciliation_order_side_net': order_side_net_payments,  # Order side net payments
+            'reconciliation_payout_side_net': payout_side_net_payments,  # Payout side net payments
+            'reconciliation_timezone_note': f"Payout dates converted to {timezone_name}" if timezone_name != "UTC" else "Original UTC dates",
+            
+            # Sales vs Payments reconciliation
+            'sales_vs_payments_expected': expected_funds_collected,  # What we should collect
+            'sales_vs_payments_actual_gross': total_payments_gross,  # What we actually received (gross)
+            'sales_vs_payments_actual_net': total_payments_net,  # What we actually received (net)
+            'sales_vs_payments_difference': sales_vs_payments_diff,  # Difference
+            'sales_vs_payments_mismatch': sales_vs_payments_mismatch,  # True if mismatch
         })
         
         df_rows.append(row)
@@ -1066,7 +1107,9 @@ def main():
     
     # Count mismatches
     mismatches = (df['reconciliation_mismatch'] == True).sum()  # Count True values
-    print(f"Mismatches found: {mismatches}")
+    sales_vs_payments_mismatches = (df['sales_vs_payments_mismatch'] == True).sum()  # Count sales vs payments mismatches
+    print(f"Shopify Payments vs Payout mismatches: {mismatches}")
+    print(f"Sales vs Total Payments mismatches: {sales_vs_payments_mismatches}")
     
     print("Reconciliation complete.")
 
