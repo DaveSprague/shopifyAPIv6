@@ -533,7 +533,7 @@ def parse_orders(order_data, use_utc_timezone, target_timezone):
         
         created_date = created_dt.date()
         processed_date = processed_dt.date()
-        date_str = str(created_date)
+        date_str = str(processed_date)
         
         # Get source and location info
         source_name = order['sourceName']
@@ -882,9 +882,9 @@ def generate_reconciliation_dataframe(by_date, detailed_transactions, order_info
         
         # Calculate Shopify payout metrics with enhanced accuracy
         # Note: Refund amounts in payout files are already negative, abs() makes them positive for display
-        shopify_payout_refunds = abs(payout_refunds['Payout Amount'].sum())  # Convert negative refunds to positive
+        shopify_payout_refunds = payout_refunds['Payout Amount'].sum() 
         shopify_amount_before_fees = payout_charges['Payout Amount'].sum()  # Only charges count as sales
-        shopify_fees = payout_day_paid['Payout Fee'].sum()
+        shopify_fees = -payout_day_paid['Payout Fee'].sum()
         shopify_net_deposit = payout_day_paid['Payout Net Deposit'].sum()
         
         # Enhanced special transaction tracking for audit purposes
